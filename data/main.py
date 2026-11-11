@@ -14,9 +14,6 @@ from sklearn.metrics import f1_score
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-# ---------------------------------------------------------
-# 1. CLASSES AND FUNCTIONS (Must be at the top level)
-# ---------------------------------------------------------
 class KneeMRIDataset(Dataset):
     def __init__(self, dataframe, root_dir, label_cols, transform=None):
         self.dataframe = dataframe.reset_index(drop=True)
@@ -57,14 +54,20 @@ class KneeMRIDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
+        raw_path = self.image_paths[idx]
+        abs_path = os.path.abspath(raw_path)
+        if os.name == 'nt' and not abs_path.startswith('\\\\?\\'):
+            img_path = '\\\\?\\' + abs_path
+        else:
+            img_path = abs_path
+
         image = Image.open(img_path).convert('RGB')
         label = torch.tensor(self.labels[idx])
 
         if self.transform:
             image = self.transform(image)
 
-        return image, label, os.path.basename(img_path)
+        return image, label, os.path.basename(raw_path)
 
 def visualize_and_save(dataloader):
     print("Generating batch visualization...")
@@ -78,7 +81,6 @@ def visualize_and_save(dataloader):
     for i, ax in enumerate(axes):
         if i >= batch_size_plot: break
         img = images[i].permute(1, 2, 0).cpu().numpy()
-        # Corrected multiplication syntax here
         img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
         img = np.clip(img, 0, 1)
         ax.imshow(img)
@@ -90,14 +92,10 @@ def visualize_and_save(dataloader):
     plt.close()
     print("Saved 'sample_mri_batch.png'")
 
-
-# ---------------------------------------------------------
-# 2. EXECUTION BLOCK (Protects Mac multiprocessing)
-# ---------------------------------------------------------
 if __name__ == '__main__':
     DATA_DIR = "archive/train_series"
     CSV_PATH = "archive/pseudolabeled-train.csv"
-    BATCH_SIZE = 32
+    BATCH_SIZE = 128
     EPOCHS = 5
     LEARNING_RATE = 1e-4
 
@@ -124,13 +122,13 @@ if __name__ == '__main__':
     train_dataset = KneeMRIDataset(train_df, DATA_DIR, label_cols, transform)
     val_dataset = KneeMRIDataset(val_df, DATA_DIR, label_cols, transform)
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+    use_cuda = (device.type == 'cuda')
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=use_cuda)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=use_cuda)
 
     print(f"\nTotal training slices: {len(train_dataset)} | Total validation slices: {len(val_dataset)}")
 
     if len(train_dataset) > 0:
-        # Pass a temporary dataloader just for plotting
         plot_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
         visualize_and_save(plot_loader)
 
@@ -140,29 +138,31 @@ if __name__ == '__main__':
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_cuda)
 
     best_f1 = 0.0
 
     for epoch in range(EPOCHS):
         print(f"\nEpoch {epoch + 1}/{EPOCHS}")
 
-        # TRAIN
         model.train()
         train_loss = 0.0
         for images, labels, _ in tqdm(train_loader, desc="Training"):
             images, labels = images.to(device), labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast('cuda', enabled=use_cuda):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item() * images.size(0)
 
         train_loss /= len(train_loader.dataset)
 
-        # VALIDATE
         model.eval()
         val_loss = 0.0
         all_preds = []
@@ -171,8 +171,10 @@ if __name__ == '__main__':
         with torch.no_grad():
             for images, labels, _ in tqdm(val_loader, desc="Validating"):
                 images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+                with torch.amp.autocast('cuda', enabled=use_cuda):
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+
                 val_loss += loss.item() * images.size(0)
 
                 preds = torch.sigmoid(outputs) > 0.5
