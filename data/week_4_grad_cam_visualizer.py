@@ -62,7 +62,7 @@ if __name__ == "__main__":
     print("Initializing Grad-CAM Interpretability Module...")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-    num_classes = 10 
+    num_classes = 12
     
     # 1. Load Model
     model = models.resnet50()
